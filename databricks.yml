@@ -1,0 +1,26 @@
+# Databricks Asset Bundle config.
+#   databricks bundle deploy -t dev
+#   databricks bundle run ingest_weather_embeddings_job -t dev
+#
+# The bundle is optional: the notebook can equally be scheduled by hand from
+# the Workflows UI, which is the path to take on Free Edition if you would
+# rather not install the CLI. See README_WEATHER.md.
+
+bundle:
+  name: databricks-lakebase-weather-rag
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-workspace-instance>.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-workspace-instance>.cloud.databricks.com
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}

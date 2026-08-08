@@ -1,0 +1,17 @@
+# Core app
+flask>=3.0.3
+requests>=2.32.3
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.1
+
+# Lakebase secret resolution + SQLAlchemy engine for notebook analysis
+databricks-sdk>=0.30.0
+sqlalchemy>=2.0.30
+
+# Embeddings. torch is a transitive dependency of sentence-transformers but is
+# pinned explicitly so a CPU-only wheel can be swapped in on constrained
+# environments:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers>=2.7.0
+torch>=2.0.0
+numpy>=1.24.0

@@ -1,0 +1,48 @@
+# Scheduled Workflow for notebooks/ingest_weather_embeddings.py.
+#
+# No `job_clusters` block: this runs on serverless compute, which is the only
+# option on Databricks Free Edition and the cheaper default everywhere else.
+# The job is light - a few hundred HTTP calls and a CPU-sized transformer -
+# so there is nothing to gain from a dedicated cluster.
+
+resources:
+  jobs:
+    ingest_weather_embeddings_job:
+      name: "[${bundle.target}] Ingest NWS Weather Embeddings"
+
+      # Every 6 hours. AFDs are reissued at least twice daily and alerts turn
+      # over continuously, so a daily schedule would leave the corpus stale
+      # for most of the day - and stale weather text is worse than none,
+      # because it retrieves confidently and answers wrongly.
+      schedule:
+        quartz_cron_expression: "0 0 0,6,12,18 * * ?"
+        timezone_id: "UTC"
+        pause_status: PAUSED  # flip to UNPAUSED after a clean manual run
+
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: ingest_weather_embeddings
+          notebook_task:
+            notebook_path: ../notebooks/ingest_weather_embeddings.py
+            base_parameters:
+              offices: "OKX,LWX,MPX,FWD,SEW,MFL,BOU,OUN,SLC,TAE"
+              product_types: "AFD,HWO,ESF"
+              limit_per_pair: "2"
+              include_alerts: "true"
+              alert_area: ""
+              alert_limit: "50"
+              embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+              chunk_size: "900"
+              chunk_overlap: "150"
+              max_requests_per_minute: "60"
+              documents_table: "weather_documents"
+              embeddings_table: "weather_embeddings"
+              reembed_all: "false"
+              # Leave blank to auto-detect; set to the Git folder path if the
+              # notebook cannot find weather_store.py on its own.
+              repo_path: ""
