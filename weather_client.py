@@ -196,14 +196,36 @@ class NWSClient:
         id / wmoCollectiveId / issuingOffice / issuanceTime / productCode /
         productName, but NOT the text body. Fetching the body is a second call
         (`get_product`), which is why syncs are two-phase.
+
+        Tries with a server-side `limit` first, since without it this
+        endpoint can return a WFO's entire product history rather than just
+        the most recent few. If NWS rejects the parameter (a plain 400, not
+        a transient 429/5xx that `get()` already retries), the request is
+        retried once without `limit` and truncated client-side instead -
+        `iter_text_products` also slices its result, so a caller two levels
+        up sees no difference either way.
+
+        This same class of parameter is what became unsupported on
+        `/alerts/active` (see `get_active_alerts`), so this endpoint gets the
+        same defensive handling even without direct evidence it needs it yet.
         """
         if office:
             path = f"/products/types/{product_type}/locations/{office}"
         else:
             path = f"/products/types/{product_type}"
 
-        data = self.get(path, params={"limit": limit})
-        return _extract_graph(data)
+        try:
+            data = self.get(path, params={"limit": limit})
+            return _extract_graph(data)[:limit]
+        except (requests.HTTPError, NWSClientError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status != 400:
+                raise
+            logger.info(
+                "%s rejected the 'limit' parameter (400); retrying without it", path
+            )
+            data = self.get(path, params={})
+            return _extract_graph(data)[:limit]
 
     def get_product(self, product_id: str) -> dict:
         """Fetch one product including its `productText` body."""
@@ -269,8 +291,19 @@ class NWSClient:
         logic in weather_store worth having.
 
         `area` is a state/marine code such as "TX" or a list of them.
+
+        `limit` is enforced client-side (the response is truncated in
+        Python after fetching), not sent as a query parameter. NWS's
+        supported parameters on `/alerts/active` have changed before without
+        notice - `limit` was accepted at one point and stopped being
+        accepted at another - and there is no version pin on this endpoint
+        to detect that ahead of time. Trimming locally means this method
+        keeps working across that kind of change instead of depending on it.
+        The cost is fetching (and normalizing) the full active-alert set
+        rather than a server-truncated one; nationwide active alerts are at
+        most a few hundred records, so this is a non-issue in practice.
         """
-        params: dict[str, Any] = {"status": "actual", "message_type": "alert", "limit": limit}
+        params: dict[str, Any] = {"status": "actual", "message_type": "alert"}
         if area:
             params["area"] = ",".join(area) if isinstance(area, list) else area
         if severity:
@@ -278,6 +311,8 @@ class NWSClient:
 
         data = self.get("/alerts/active", params=params)
         features = data.get("features") or []
+        if limit:
+            features = features[:limit]
         docs = []
         for feature in features:
             doc = normalize_alert(feature)
