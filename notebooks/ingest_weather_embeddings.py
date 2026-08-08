@@ -11,11 +11,26 @@
 # MAGIC    text hasn't changed since the last run.
 # MAGIC 3. Chunks each changed document on its own section boundaries and
 # MAGIC    embeds the chunks with `sentence-transformers`.
-# MAGIC 4. Writes the vectors into `weather_embeddings` (`pgvector`) using
-# MAGIC    `psycopg2` with an explicit `::vector` cast - no array staging table
+# MAGIC 4. Writes the vectors into `weather_embeddings` (`pgvector`), with an
+# MAGIC    explicit `::vector` cast on every insert - no array staging table
 # MAGIC    and no follow-up `UPDATE ... ::vector` pass.
 # MAGIC 5. Runs a sample similarity query so a green run proves retrieval works,
 # MAGIC    not just that rows landed.
+# MAGIC
+# MAGIC ## Why this notebook uses `pg8000`, not `psycopg2`
+# MAGIC
+# MAGIC `psycopg2`'s C extension crashes the sandboxed kernel on Databricks
+# MAGIC **Serverless** notebook compute - not a normal Python exception, a hard
+# MAGIC `SIGABRT` that kills the whole kernel the moment the module is imported.
+# MAGIC `app.py` (a Databricks App, not a notebook) runs in an unsandboxed
+# MAGIC container and is unaffected, so it keeps using `psycopg2` via
+# MAGIC `lakebase.py` / `weather_store.py`. This notebook does **not** import
+# MAGIC either of those modules, and instead reimplements the same DDL, upsert,
+# MAGIC and search SQL directly against
+# MAGIC [`pg8000`](https://github.com/tlocke/pg8000), a pure-Python driver with
+# MAGIC no C extension to crash. If you run this notebook on a classic
+# MAGIC (non-serverless) cluster, `psycopg2` would work fine there too - `pg8000`
+# MAGIC is used unconditionally anyway so the same notebook runs on both.
 # MAGIC
 # MAGIC It reuses the same Lakebase secret as the Flask app (scope `database`,
 # MAGIC key `lakebase-url`) and needs no API key of its own, because NWS
@@ -27,7 +42,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install dependencies
-# MAGIC %pip install -q 'databricks-sdk>=0.30.0' psycopg2-binary sentence-transformers requests
+# MAGIC %pip install -q 'databricks-sdk>=0.30.0' pg8000 sentence-transformers requests
 
 # COMMAND ----------
 
@@ -39,8 +54,8 @@ dbutils.library.restartPython()
 # MAGIC ## Configuration
 # MAGIC
 # MAGIC Widgets let a scheduled Job override every knob without editing code.
-# MAGIC When there is no `dbutils` (running as a script), the same names are
-# MAGIC read from environment variables instead.
+# MAGIC When there is no `dbutils` (running as a plain script), the same names
+# MAGIC are read from environment variables instead.
 
 # COMMAND ----------
 
@@ -111,13 +126,18 @@ print(f"Chunking       : {CHUNK_SIZE} chars / {CHUNK_OVERLAP} overlap")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Import the shared pipeline modules
+# MAGIC ## Import `weather_client` and `embeddings` only
 # MAGIC
-# MAGIC `weather_client`, `embeddings`, and `weather_store` live at the repo
-# MAGIC root. Importing them here rather than copying their logic into the
-# MAGIC notebook is what guarantees the notebook chunks and embeds text exactly
-# MAGIC the way `/weather/search` embeds the query - if those two ever diverge,
-# MAGIC cosine similarity stops meaning anything.
+# MAGIC These two modules are pure - no `psycopg2` anywhere in their import
+# MAGIC chain - so it's safe to import them directly from the repo root. This is
+# MAGIC what keeps the notebook's harvesting and chunking logic identical to the
+# MAGIC Flask app's: if the app embeds a query one way and this notebook embeds
+# MAGIC the corpus a different way, cosine similarity stops meaning anything.
+# MAGIC
+# MAGIC `weather_store.py` and `lakebase.py` are deliberately **not** imported -
+# MAGIC both pull in `psycopg2` at module load time, which is exactly the import
+# MAGIC that crashes the serverless kernel. All of the DDL/upsert/search SQL
+# MAGIC those modules contain is reimplemented below against `pg8000` instead.
 
 # COMMAND ----------
 
@@ -127,7 +147,7 @@ from pathlib import Path
 
 
 def find_repo_root() -> Path:
-    """Locate the folder holding weather_store.py, from a notebook or a script."""
+    """Locate the folder holding weather_client.py, from a notebook or a script."""
     explicit = param("repo_path").strip()
     if explicit:
         return Path(explicit)
@@ -154,10 +174,10 @@ def find_repo_root() -> Path:
     candidates.append(Path.cwd().parent)
 
     for candidate in candidates:
-        if (candidate / "weather_store.py").exists():
+        if (candidate / "weather_client.py").exists():
             return candidate
     raise RuntimeError(
-        "Could not locate the repo root (the folder containing weather_store.py). "
+        "Could not locate the repo root (the folder containing weather_client.py). "
         "Set the `repo_path` widget to its absolute path, e.g. "
         "/Workspace/Users/you@example.com/databricks-lakebase-weather-rag"
     )
@@ -168,9 +188,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 print(f"Repo root: {REPO_ROOT}")
 
-import embeddings as emb  # noqa: E402
-import weather_store  # noqa: E402
-from weather_client import NWSClient  # noqa: E402
+import embeddings as emb  # noqa: E402  -  pure, no psycopg2
+from weather_client import NWSClient  # noqa: E402  -  pure, no psycopg2
 
 EMBEDDING_DIM = emb.resolve_dimension(EMBEDDING_MODEL)
 print(f"Vector width: {EMBEDDING_DIM}")
@@ -178,19 +197,23 @@ print(f"Vector width: {EMBEDDING_DIM}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Connect to Lakebase
+# MAGIC ## Connect to Lakebase with `pg8000`
 # MAGIC
-# MAGIC Same secret the Flask app uses. The URL is parsed into discrete
-# MAGIC psycopg2 keyword arguments so a password containing URL-reserved
-# MAGIC characters survives intact.
+# MAGIC Same secret the Flask app uses (`database/lakebase-url`), parsed into
+# MAGIC discrete connection arguments. `pg8000` speaks the Postgres wire
+# MAGIC protocol directly in Python - no compiled `libpq` binding to conflict
+# MAGIC with the notebook sandbox - and accepts the same `%s`-style parameter
+# MAGIC placeholders as `psycopg2`, so the SQL below reads the same way it would
+# MAGIC against either driver.
 
 # COMMAND ----------
 
 # DBTITLE 1,Resolve the connection and open a session
 import base64
+import ssl
 from urllib.parse import urlparse
 
-import psycopg2
+import pg8000.dbapi as pg8000
 
 
 def resolve_lakebase_url() -> str:
@@ -215,44 +238,121 @@ parsed = urlparse(resolve_lakebase_url())
 CONN_PARAMS = {
     "host": parsed.hostname,
     "port": parsed.port or 5432,
-    "dbname": (parsed.path or "").lstrip("/") or "databricks_postgres",
+    "database": (parsed.path or "").lstrip("/") or "databricks_postgres",
     "user": parsed.username,
     "password": parsed.password,
-    "sslmode": "require",
-    "connect_timeout": 30,
+    "ssl_context": ssl.create_default_context(),
+    "timeout": 30,
 }
 
 print(f"Host    : {CONN_PARAMS['host']}:{CONN_PARAMS['port']}")
-print(f"Database: {CONN_PARAMS['dbname']}")
+print(f"Database: {CONN_PARAMS['database']}")
 print(f"Role    : {CONN_PARAMS['user']}")
 
-conn = psycopg2.connect(**CONN_PARAMS)
-with conn.cursor() as cur:
-    cur.execute("SELECT version()")
-    print("Connected:", cur.fetchone()[0].split(",")[0])
+conn = pg8000.connect(**CONN_PARAMS)
+conn.autocommit = False
+
+
+def q(sql: str, params: tuple = ()) -> list[tuple]:
+    """Execute a query and fetch all rows. Opens/closes its own cursor."""
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        try:
+            return cur.fetchall()
+        except Exception:  # noqa: BLE001 - statement had no result set
+            return []
+    finally:
+        cur.close()
+
+
+def x(sql: str, params: tuple = ()) -> None:
+    """Execute a statement with no result set expected (DDL, plain writes)."""
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+    finally:
+        cur.close()
+
+
+print("Connected:", q("SELECT version()")[0][0].split(",")[0])
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Create the schema
 # MAGIC
-# MAGIC `ensure_schema` enables `pgvector`, creates `weather_documents` and
-# MAGIC `weather_embeddings`, and builds the HNSW cosine index. Idempotent, so
-# MAGIC it runs on every execution and the notebook needs no manual SQL step
-# MAGIC beforehand. (The equivalent statements are in `sql/` if you would
-# MAGIC rather apply them by hand.)
+# MAGIC Enables `pgvector`, creates `weather_documents` and `weather_embeddings`,
+# MAGIC and builds the HNSW cosine index. Idempotent, so it runs on every
+# MAGIC execution and needs no manual SQL step beforehand. (The equivalent
+# MAGIC statements, generated from the exact same source of truth, are also in
+# MAGIC `sql/` if you would rather apply them by hand through the Lakebase SQL
+# MAGIC editor.)
+# MAGIC
+# MAGIC HNSW rather than IVFFlat: IVFFlat needs a representative sample of rows
+# MAGIC to build usable lists and degrades badly when the table is small or
+# MAGIC grows in bursts - exactly the shape of a weather corpus that refills
+# MAGIC every few hours. HNSW is built incrementally and needs no training pass.
 
 # COMMAND ----------
 
-weather_store.DOCUMENTS_TABLE = DOCUMENTS_TABLE
-weather_store.EMBEDDINGS_TABLE = EMBEDDINGS_TABLE
+DDL = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {DOCUMENTS_TABLE} (
+        id              TEXT PRIMARY KEY,
+        source          TEXT NOT NULL,
+        product_code    TEXT NOT NULL,
+        product_name    TEXT,
+        office_id       TEXT,
+        wmo_id          TEXT,
+        headline        TEXT,
+        area_desc       TEXT,
+        severity        TEXT,
+        certainty       TEXT,
+        urgency         TEXT,
+        issued_at       TIMESTAMPTZ,
+        effective_at    TIMESTAMPTZ,
+        expires_at      TIMESTAMPTZ,
+        raw_text        TEXT NOT NULL,
+        text_sha256     TEXT NOT NULL,
+        char_count      INTEGER NOT NULL DEFAULT 0,
+        payload         JSONB,
+        synced_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS idx_{DOCUMENTS_TABLE}_office ON {DOCUMENTS_TABLE} (office_id)",
+    f"CREATE INDEX IF NOT EXISTS idx_{DOCUMENTS_TABLE}_code ON {DOCUMENTS_TABLE} (product_code)",
+    f"CREATE INDEX IF NOT EXISTS idx_{DOCUMENTS_TABLE}_issued ON {DOCUMENTS_TABLE} (issued_at DESC)",
+    f"CREATE INDEX IF NOT EXISTS idx_{DOCUMENTS_TABLE}_source ON {DOCUMENTS_TABLE} (source)",
+    "CREATE EXTENSION IF NOT EXISTS vector",
+    f"""
+    CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE} (
+        id            TEXT PRIMARY KEY,
+        document_id   TEXT NOT NULL REFERENCES {DOCUMENTS_TABLE}(id) ON DELETE CASCADE,
+        chunk_index   INTEGER NOT NULL,
+        chunk_text    TEXT NOT NULL,
+        char_count    INTEGER NOT NULL DEFAULT 0,
+        product_code  TEXT,
+        office_id     TEXT,
+        issued_at     TIMESTAMPTZ,
+        embedding     VECTOR({EMBEDDING_DIM}) NOT NULL,
+        model_name    TEXT NOT NULL,
+        embedded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (document_id, chunk_index)
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE}_document ON {EMBEDDINGS_TABLE} (document_id)",
+    f"CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE}_model ON {EMBEDDINGS_TABLE} (model_name)",
+    f"""
+    CREATE INDEX IF NOT EXISTS idx_{EMBEDDINGS_TABLE}_vector
+    ON {EMBEDDINGS_TABLE} USING hnsw (embedding vector_cosine_ops)
+    """,
+]
 
-weather_store.ensure_schema(
-    conn,
-    dim=EMBEDDING_DIM,
-    documents_table=DOCUMENTS_TABLE,
-    embeddings_table=EMBEDDINGS_TABLE,
-)
+for statement in DDL:
+    x(statement)
+conn.commit()
 print(f"Schema ready: {DOCUMENTS_TABLE}, {EMBEDDINGS_TABLE} (VECTOR({EMBEDDING_DIM}))")
 
 # COMMAND ----------
@@ -302,15 +402,105 @@ if documents:
 # MAGIC %md
 # MAGIC ## Upsert into `weather_documents`
 # MAGIC
-# MAGIC The upsert compares a SHA-256 of the body and skips rows whose text is
-# MAGIC byte-identical to what is already stored. AFDs are reissued on a fixed
-# MAGIC schedule but often barely change between issuances, so on a typical run
-# MAGIC most documents are no-ops - and only the ones that genuinely moved get
-# MAGIC re-embedded in the next cell.
+# MAGIC One multi-row `INSERT ... VALUES (...),(...),... ON CONFLICT DO UPDATE`
+# MAGIC per batch, with `WHERE text_sha256 IS DISTINCT FROM EXCLUDED.text_sha256`
+# MAGIC so a row that hasn't actually changed produces no write - `RETURNING id`
+# MAGIC then tells us exactly which documents changed. AFDs are reissued on a
+# MAGIC fixed schedule but often barely change between issuances, so on a
+# MAGIC typical run most documents are no-ops, and only the ones that genuinely
+# MAGIC moved get re-embedded in the next cell.
+# MAGIC
+# MAGIC `pg8000` does not have `psycopg2.extras.execute_values`, so the
+# MAGIC multi-row `VALUES` list is built by hand here - `execute_values` was the
+# MAGIC only piece of `weather_store.py` that couldn't be ported as-is.
 
 # COMMAND ----------
 
-result = weather_store.upsert_documents(conn, documents, table=DOCUMENTS_TABLE)
+import hashlib
+import json
+
+
+def text_digest(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def upsert_documents(documents: list[dict], batch_size: int = 100) -> dict:
+    """Upsert documents in batches, returning counts. Mirrors weather_store.upsert_documents."""
+    rows = []
+    for doc in documents:
+        text = doc.get("raw_text") or ""
+        if not text.strip():
+            continue
+        rows.append(
+            (
+                str(doc["id"]),
+                doc.get("source") or "unknown",
+                doc.get("product_code") or "UNKNOWN",
+                doc.get("product_name"),
+                doc.get("office_id"),
+                doc.get("wmo_id"),
+                doc.get("headline"),
+                doc.get("area_desc"),
+                doc.get("severity"),
+                doc.get("certainty"),
+                doc.get("urgency"),
+                doc.get("issued_at"),
+                doc.get("effective_at"),
+                doc.get("expires_at"),
+                text,
+                text_digest(text),
+                len(text),
+                json.dumps(doc.get("payload") or {}),
+            )
+        )
+
+    if not rows:
+        return {"received": len(documents), "written": 0, "unchanged": len(documents)}
+
+    written = 0
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        placeholders = ",".join(
+            ["(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::timestamptz,%s::timestamptz,"
+             "%s::timestamptz,%s,%s,%s,%s::jsonb)"] * len(batch)
+        )
+        flat = [value for row in batch for value in row]
+        sql = f"""
+            INSERT INTO {DOCUMENTS_TABLE} (
+                id, source, product_code, product_name, office_id, wmo_id,
+                headline, area_desc, severity, certainty, urgency,
+                issued_at, effective_at, expires_at,
+                raw_text, text_sha256, char_count, payload
+            ) VALUES {placeholders}
+            ON CONFLICT (id) DO UPDATE SET
+                source        = EXCLUDED.source,
+                product_code  = EXCLUDED.product_code,
+                product_name  = EXCLUDED.product_name,
+                office_id     = EXCLUDED.office_id,
+                wmo_id        = EXCLUDED.wmo_id,
+                headline      = EXCLUDED.headline,
+                area_desc     = EXCLUDED.area_desc,
+                severity      = EXCLUDED.severity,
+                certainty     = EXCLUDED.certainty,
+                urgency       = EXCLUDED.urgency,
+                issued_at     = EXCLUDED.issued_at,
+                effective_at  = EXCLUDED.effective_at,
+                expires_at    = EXCLUDED.expires_at,
+                raw_text      = EXCLUDED.raw_text,
+                text_sha256   = EXCLUDED.text_sha256,
+                char_count    = EXCLUDED.char_count,
+                payload       = EXCLUDED.payload,
+                updated_at    = now()
+            WHERE {DOCUMENTS_TABLE}.text_sha256 IS DISTINCT FROM EXCLUDED.text_sha256
+            RETURNING id
+        """
+        written += len(q(sql, tuple(flat)))
+        conn.commit()
+
+    return {"received": len(documents), "written": written, "unchanged": len(rows) - written}
+
+
+result = upsert_documents(documents)
 print(f"Received : {result['received']}")
 print(f"Written  : {result['written']}   (new or changed)")
 print(f"Unchanged: {result['unchanged']} (skipped)")
@@ -328,17 +518,35 @@ print(f"Unchanged: {result['unchanged']} (skipped)")
 # COMMAND ----------
 
 if REEMBED_ALL:
-    with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {EMBEDDINGS_TABLE}")
+    x(f"DELETE FROM {EMBEDDINGS_TABLE}")
     conn.commit()
     print("reembed_all=true - cleared existing vectors")
 
-pending = weather_store.documents_needing_embedding(
-    conn,
-    model_name=EMBEDDING_MODEL,
-    documents_table=DOCUMENTS_TABLE,
-    embeddings_table=EMBEDDINGS_TABLE,
+pending_rows = q(
+    f"""
+    SELECT d.id, d.source, d.product_code, d.office_id, d.issued_at, d.raw_text
+    FROM {DOCUMENTS_TABLE} d
+    WHERE NOT EXISTS (
+        SELECT 1 FROM {EMBEDDINGS_TABLE} e
+        WHERE e.document_id = d.id
+          AND e.model_name = %s
+          AND e.embedded_at >= d.updated_at
+    )
+    ORDER BY d.issued_at DESC NULLS LAST
+    """,
+    (EMBEDDING_MODEL,),
 )
+pending = [
+    {
+        "id": row[0],
+        "source": row[1],
+        "product_code": row[2],
+        "office_id": row[3],
+        "issued_at": row[4],
+        "raw_text": row[5],
+    }
+    for row in pending_rows
+]
 print(f"{len(pending)} documents need embedding with {EMBEDDING_MODEL}")
 
 # COMMAND ----------
@@ -355,12 +563,69 @@ print(f"{len(pending)} documents need embedding with {EMBEDDING_MODEL}")
 # MAGIC Embedding runs on the driver. all-MiniLM-L6-v2 is ~80 MB and handles a
 # MAGIC few thousand chunks per minute on CPU, which covers a corpus of this
 # MAGIC size comfortably - and Free Edition serverless has no GPU to
-# MAGIC distribute to anyway. A Spark pandas UDF would be the move at a scale
-# MAGIC where the driver becomes the bottleneck.
+# MAGIC distribute to anyway.
+# MAGIC
+# MAGIC Writing is delete-then-insert per document, not upsert-by-chunk-index:
+# MAGIC when a product is reissued its text changes length, so the new version
+# MAGIC may have fewer chunks than the old one. Deleting first means a shorter
+# MAGIC reissue can never leave a surplus chunk behind as an orphaned passage
+# MAGIC that still matches queries - a stale forecast surfacing as if current.
 
 # COMMAND ----------
 
 # DBTITLE 1,Compute and write vectors
+def replace_document_embeddings(
+    document_id: str,
+    chunks: list[str],
+    vectors: list[list[float]],
+    product_code,
+    office_id,
+    issued_at,
+) -> int:
+    """Delete all vectors for one document, then insert the current set. Mirrors
+    weather_store.replace_document_embeddings."""
+    x(f"DELETE FROM {EMBEDDINGS_TABLE} WHERE document_id = %s", (document_id,))
+    if not chunks:
+        conn.commit()
+        return 0
+
+    rows = [
+        (
+            f"{document_id}::{index}",
+            document_id,
+            index,
+            chunk,
+            len(chunk),
+            product_code,
+            office_id,
+            issued_at,
+            emb.to_pgvector(vector),
+            EMBEDDING_MODEL,
+        )
+        for index, (chunk, vector) in enumerate(zip(chunks, vectors))
+    ]
+
+    placeholders = ",".join(
+        ["(%s,%s,%s,%s,%s,%s,%s,%s::timestamptz,%s::vector,%s,now())"] * len(rows)
+    )
+    flat = [value for row in rows for value in row]
+    sql = f"""
+        INSERT INTO {EMBEDDINGS_TABLE} (
+            id, document_id, chunk_index, chunk_text, char_count,
+            product_code, office_id, issued_at, embedding, model_name, embedded_at
+        ) VALUES {placeholders}
+        ON CONFLICT (id) DO UPDATE SET
+            chunk_text  = EXCLUDED.chunk_text,
+            char_count  = EXCLUDED.char_count,
+            embedding   = EXCLUDED.embedding,
+            model_name  = EXCLUDED.model_name,
+            embedded_at = EXCLUDED.embedded_at
+    """
+    x(sql, tuple(flat))
+    conn.commit()
+    return len(chunks)
+
+
 model = emb.load_model(EMBEDDING_MODEL)
 
 total_chunks = 0
@@ -377,16 +642,13 @@ for i, doc in enumerate(pending, start=1):
 
     vectors = emb.embed_texts(chunks, model=model, batch_size=32)
 
-    total_chunks += weather_store.replace_document_embeddings(
-        conn,
+    total_chunks += replace_document_embeddings(
         document_id=doc["id"],
         chunks=chunks,
         vectors=vectors,
-        model_name=EMBEDDING_MODEL,
         product_code=doc.get("product_code"),
         office_id=doc.get("office_id"),
         issued_at=doc.get("issued_at"),
-        table=EMBEDDINGS_TABLE,
     )
     processed += 1
 
@@ -406,28 +668,38 @@ if skipped:
 
 # COMMAND ----------
 
-stats = weather_store.stats(
-    conn, documents_table=DOCUMENTS_TABLE, embeddings_table=EMBEDDINGS_TABLE
-)
-for key, value in stats.items():
-    print(f"{key:22}: {value}")
+stats_row = q(
+    f"""
+    SELECT
+        (SELECT count(*) FROM {DOCUMENTS_TABLE})                     AS documents,
+        (SELECT count(*) FROM {EMBEDDINGS_TABLE})                    AS chunks,
+        (SELECT count(DISTINCT document_id) FROM {EMBEDDINGS_TABLE}) AS embedded_documents,
+        (SELECT count(DISTINCT office_id) FROM {DOCUMENTS_TABLE})    AS offices,
+        (SELECT max(issued_at) FROM {DOCUMENTS_TABLE})               AS latest_issued_at,
+        (SELECT max(embedded_at) FROM {EMBEDDINGS_TABLE})            AS latest_embedded_at
+    """
+)[0]
+for label, value in zip(
+    ("documents", "chunks", "embedded_documents", "offices", "latest_issued_at", "latest_embedded_at"),
+    stats_row,
+):
+    print(f"{label:22}: {value}")
 
-with conn.cursor() as cur:
-    cur.execute(
-        f"""
-        SELECT d.product_code,
-               count(DISTINCT d.id)  AS documents,
-               count(e.id)           AS chunks,
-               round(avg(e.char_count)) AS avg_chunk_chars
-        FROM {DOCUMENTS_TABLE} d
-        LEFT JOIN {EMBEDDINGS_TABLE} e ON e.document_id = d.id
-        GROUP BY d.product_code
-        ORDER BY documents DESC
-        """
-    )
-    print("\nproduct_code  documents  chunks  avg_chunk_chars")
-    for row in cur.fetchall():
-        print(f"{row[0]:<13} {row[1]:>9} {row[2]:>7} {str(row[3]):>16}")
+coverage = q(
+    f"""
+    SELECT d.product_code,
+           count(DISTINCT d.id)     AS documents,
+           count(e.id)              AS chunks,
+           round(avg(e.char_count)) AS avg_chunk_chars
+    FROM {DOCUMENTS_TABLE} d
+    LEFT JOIN {EMBEDDINGS_TABLE} e ON e.document_id = d.id
+    GROUP BY d.product_code
+    ORDER BY documents DESC
+    """
+)
+print("\nproduct_code  documents  chunks  avg_chunk_chars")
+for row in coverage:
+    print(f"{row[0]:<13} {row[1]:>9} {row[2]:>7} {str(row[3]):>16}")
 
 # COMMAND ----------
 
@@ -435,12 +707,43 @@ with conn.cursor() as cur:
 # MAGIC ## Smoke test the retrieval path
 # MAGIC
 # MAGIC The same query the Flask endpoint serves, run through the same
-# MAGIC `weather_store.search` code. A run that inserts rows but retrieves
-# MAGIC nothing is a failed run, and this is what catches it - a dimension
-# MAGIC mismatch or a missing HNSW index shows up here rather than in
-# MAGIC production traffic.
+# MAGIC cosine-similarity SQL `weather_store.search` uses. A run that inserts
+# MAGIC rows but retrieves nothing is a failed run, and this is what catches it
+# MAGIC - a dimension mismatch or a missing HNSW index shows up here rather than
+# MAGIC in production traffic.
 
 # COMMAND ----------
+
+def search(query_vector: list[float], limit: int = 3) -> list[dict]:
+    """Grouped-by-document cosine search. Mirrors weather_store.search's default mode."""
+    vector_literal = emb.to_pgvector(query_vector)
+    candidates = max(limit, limit * 6)
+    sql = f"""
+        WITH candidates AS (
+            SELECT
+                e.document_id, e.chunk_text, d.product_code, d.office_id,
+                1 - (e.embedding <=> %s::vector) AS similarity
+            FROM {EMBEDDINGS_TABLE} e
+            JOIN {DOCUMENTS_TABLE} d ON d.id = e.document_id
+            WHERE e.model_name = %s
+            ORDER BY e.embedding <=> %s::vector
+            LIMIT %s
+        ),
+        best_per_document AS (
+            SELECT DISTINCT ON (document_id) *
+            FROM candidates
+            ORDER BY document_id, similarity DESC
+        )
+        SELECT * FROM best_per_document
+        ORDER BY similarity DESC
+        LIMIT %s
+    """
+    rows = q(sql, (vector_literal, EMBEDDING_MODEL, vector_literal, candidates, limit))
+    return [
+        {"document_id": r[0], "chunk_text": r[1], "product_code": r[2], "office_id": r[3], "similarity": r[4]}
+        for r in rows
+    ]
+
 
 SAMPLE_QUERIES = [
     "flash flood risk this weekend",
@@ -450,14 +753,7 @@ SAMPLE_QUERIES = [
 
 for query in SAMPLE_QUERIES:
     vector = emb.embed_query(query, EMBEDDING_MODEL)
-    hits = weather_store.search(
-        conn,
-        query_vector=vector,
-        limit=3,
-        model_name=EMBEDDING_MODEL,
-        documents_table=DOCUMENTS_TABLE,
-        embeddings_table=EMBEDDINGS_TABLE,
-    )
+    hits = search(vector, limit=3)
     print(f"\n=== {query!r} -> {len(hits)} hits")
     for hit in hits:
         preview = " ".join(hit["chunk_text"].split())[:160]
