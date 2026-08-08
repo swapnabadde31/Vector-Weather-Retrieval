@@ -38,6 +38,19 @@
 # MAGIC
 # MAGIC Runs on Databricks Serverless (Free Edition) and as a plain script:
 # MAGIC `LAKEBASE_URL=postgresql://... python notebooks/ingest_weather_embeddings.py`
+# MAGIC
+# MAGIC ## Run this top to bottom (`Run all`), not cell-by-cell out of order
+# MAGIC
+# MAGIC The second cell calls `dbutils.library.restartPython()` right after
+# MAGIC `%pip install`, which clears **every** Python variable in the kernel.
+# MAGIC If you then re-run a single cell further down in isolation - common
+# MAGIC while iterating on, say, just the schema or just the search cell -
+# MAGIC without first re-running the cells above it in that same session, you'll
+# MAGIC hit `NameError: name '...' is not defined` for whatever variable that
+# MAGIC cell expected from earlier (`EMBEDDING_DIM`, `conn`, `client`, `model`,
+# MAGIC `pending`, etc.). If you see that, use **Run all**, or right-click the
+# MAGIC cell that failed and choose **Run cells above**, rather than re-running
+# MAGIC just the one cell.
 
 # COMMAND ----------
 
@@ -293,8 +306,22 @@ print("Connected:", q("SELECT version()")[0][0].split(",")[0])
 # MAGIC to build usable lists and degrades badly when the table is small or
 # MAGIC grows in bursts - exactly the shape of a weather corpus that refills
 # MAGIC every few hours. HNSW is built incrementally and needs no training pass.
+# MAGIC
+# MAGIC **If this cell is ever re-run on its own** (e.g. while iterating on the
+# MAGIC schema) in a kernel session where the cells above it did *not* also run
+# MAGIC - most commonly right after `dbutils.library.restartPython()`, which
+# MAGIC clears every Python variable - `EMBEDDING_MODEL`/`EMBEDDING_DIM` would
+# MAGIC otherwise raise `NameError`. Both are cheap, pure lookups (a widget read
+# MAGIC and a dict lookup, no network or DB calls), so they're recomputed here
+# MAGIC rather than trusted from the "Import" cell above. `conn`/`q`/`x` are not
+# MAGIC recoverable this way - if those are undefined, the fix is **Run all**
+# MAGIC (or "Run cells above"), not a local patch, since re-deriving a live
+# MAGIC connection isn't a one-line fix.
 
 # COMMAND ----------
+
+EMBEDDING_MODEL = param("embedding_model")
+EMBEDDING_DIM = emb.resolve_dimension(EMBEDDING_MODEL)
 
 DDL = [
     f"""
