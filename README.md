@@ -26,17 +26,50 @@ limitations. This file is the setup and deployment guide.
 - `embeddings.py` - text normalization, section-aware chunking, and
   sentence-transformers embedding, shared by the app, the notebook, and the CLI
 - `weather_store.py` - Lakebase DDL/migrations, upsert, and pgvector search
-- `lakebase.py` - connection helper (env var locally, Databricks secret when deployed)
+  (`psycopg2`-based; used by `app.py` and `scripts/run_pipeline.py`, **not**
+  imported by the notebook - see the driver note below)
+- `lakebase.py` - connection helper (env var locally, Databricks secret when
+  deployed; also `psycopg2`-based, same restriction as above)
 - `setup_secrets.py` - one-time script to store the Lakebase URL as a secret
 - `notebooks/ingest_weather_embeddings.py` - self-contained ETL notebook:
-  harvest -> upsert -> chunk -> embed -> verify, runs on serverless compute
+  harvest -> upsert -> chunk -> embed -> verify, runs on serverless compute.
+  Uses `pg8000`, not `psycopg2` - see below
 - `scripts/run_pipeline.py` - CLI for sync/embed/search without a server
+  (`psycopg2`-based, via `weather_store.py`/`lakebase.py`)
 - `sql/` - the same DDL as `weather_store.py`, as reviewable/applyable SQL
 - `templates/index.html` - search UI
 - `tests/test_pipeline.py` - offline tests (normalizers, chunking, SQL construction)
 - `databricks.yml` + `resources/ingest_weather_embeddings_job.yml` - optional
   Asset Bundle config to schedule the notebook as a Workflow
 - `.env.example` - local dev env var template
+
+## Why the notebook uses a different Postgres driver than everything else
+
+`app.py`, `weather_store.py`, `lakebase.py`, and `scripts/run_pipeline.py` all
+use `psycopg2`. **`notebooks/ingest_weather_embeddings.py` does not** - it
+connects with [`pg8000`](https://github.com/tlocke/pg8000) instead, and it
+does not import `weather_store.py` or `lakebase.py` at all (both pull in
+`psycopg2` as soon as they're imported).
+
+The reason: `psycopg2`'s compiled C extension crashes the sandboxed Python
+kernel used by **Databricks Serverless notebook compute** - not a normal
+`ImportError`, but a hard `SIGABRT` that kills the entire kernel the instant
+the module is imported. This is a documented constraint of that environment
+(Databricks' own guidance is to avoid `psycopg2` on serverless notebooks), and
+it's why Free Edition - which runs everything on serverless - needs a
+different driver for the one piece of this project that's a notebook rather
+than an app.
+
+`app.py` is unaffected because Databricks Apps run in a normal, unsandboxed
+container, not the notebook kernel - so it keeps `psycopg2` (via
+`weather_store.py`/`lakebase.py`), and so does the CLI, which runs as a plain
+script outside Databricks entirely.
+
+The notebook reimplements the DDL, upsert, embedding-write, and search SQL
+directly (rather than importing `weather_store.py`), using the exact same
+statements - just executed through `pg8000`'s cursor instead of `psycopg2`'s.
+If you change the schema or the upsert/search logic, update it in **both**
+`weather_store.py` and the notebook's inline SQL.
 
 ## Step-by-step setup
 

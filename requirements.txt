@@ -1,10 +1,13 @@
-# Core app
+# Core app (Flask, run as a Databricks App - NOT sandboxed notebook compute,
+# so psycopg2's C extension is safe here).
 flask>=3.0.3
 requests>=2.32.3
 psycopg2-binary>=2.9.9
 python-dotenv>=1.0.1
 
-# Lakebase secret resolution + SQLAlchemy engine for notebook analysis
+# Lakebase secret resolution + SQLAlchemy engine (app + CLI use this; the
+# ingestion notebook resolves its own secret via dbutils/WorkspaceClient and
+# does not use SQLAlchemy).
 databricks-sdk>=0.30.0
 sqlalchemy>=2.0.30
 
@@ -15,3 +18,10 @@ sqlalchemy>=2.0.30
 sentence-transformers>=2.7.0
 torch>=2.0.0
 numpy>=1.24.0
+
+# NOT listed here: pg8000. The ingestion notebook (notebooks/ingest_weather_embeddings.py)
+# installs it itself via `%pip install` in its first cell, because it deliberately
+# avoids psycopg2 - psycopg2's C extension crashes the sandboxed kernel on
+# Databricks Serverless notebook compute (SIGABRT on import). pg8000 is a
+# pure-Python driver with no such conflict. See the notebook's header cell and
+# README.md's "psycopg2 vs pg8000" note for the full explanation.

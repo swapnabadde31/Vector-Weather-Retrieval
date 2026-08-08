@@ -243,3 +243,16 @@ Full setup (Lakebase instance, secret, deployment) is in the main
   migration, but there's no tooling to actually run and compare them
   side-by-side - you'd do it by hand with two `run_pipeline.py search --model
   ...` calls today.
+- **Two Postgres drivers in one project, and they must be kept in sync by
+  hand.** `weather_store.py` (used by the app and the CLI) is `psycopg2`;
+  the notebook is `pg8000`, because `psycopg2` crashes Databricks Serverless
+  notebook compute on import. The notebook reimplements the DDL/upsert/search
+  SQL inline rather than importing `weather_store.py`, so a schema or query
+  change made in one place doesn't automatically apply to the other - a real
+  maintenance cost of working around the sandbox constraint. A cleaner fix
+  would be a single driver-agnostic SQL layer (e.g. SQLAlchemy Core with the
+  `pg8000` dialect everywhere, including the app), which would remove the
+  duplication entirely; I kept `psycopg2` for the app because it's the more
+  common/battle-tested choice for a long-running service and the constraint
+  is specific to sandboxed notebook compute, not to Postgres apps generally.
+
