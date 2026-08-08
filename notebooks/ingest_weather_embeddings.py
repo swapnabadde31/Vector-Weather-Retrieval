@@ -414,8 +414,12 @@ documents = list(
 )
 print(f"Fetched {len(documents)} text products in {time.time() - started:.0f}s")
 
-if INCLUDE_ALERTS:
+if INCLUDE_ALERTS and ALERT_AREA:
     alerts = client.get_active_alerts(area=ALERT_AREA, limit=ALERT_LIMIT)
+    print(f"Fetched {len(alerts)} active alerts")
+    documents.extend(alerts)
+elif INCLUDE_ALERTS and not ALERT_AREA:
+    alerts = client.get_active_alerts(limit=ALERT_LIMIT)
     print(f"Fetched {len(alerts)} active alerts")
     documents.extend(alerts)
 
